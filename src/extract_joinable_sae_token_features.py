@@ -22,7 +22,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from extract_llm_token_activations import (
+from src.extract_llm_token_activations import (
     configure_logging,
     infer_output_format,
     make_progress,

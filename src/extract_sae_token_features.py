@@ -22,7 +22,7 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
-from code_dataset import CodeLLMPygmentsDataset
+from src.code_dataset import CodeLLMPygmentsDataset
 
 
 def parse_args() -> argparse.Namespace:

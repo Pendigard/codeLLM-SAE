@@ -22,15 +22,19 @@ python -m src.extract_sae_text_token_features \
 
 # Build the token annotation dataset, aligning LLM tokens with code tokens and annotating them with various metadata
 
-python -m build_token_annotation_dataset \
-  --snippets-dir /Vrac/renton/code_snippets \
+python -m src.build_token_annotation_dataset \
+  --snippets-dir code_snippets \
   --tokenizer-name google/gemma-2-2b \
-  --output-path outputs/code_token_annotations_3.parquet
+  --output-path outputs/labels/code_token_annotations.parquet
 
 # Extract the activations for the LLM tokens
 
-python -m extract_llm_token_activations \
-  --snippets-dir /Vrac/renton/code_snippets \
+/usr/local/bin/gpu-job-run \
+  --memory-high 36G \
+  --memory-max 48G \
+  --oom-score-adjust 700 \
+  -- python -m src.extract_llm_token_activations \
+  --snippets-dir code_snippets \
   --model-name google/gemma-2-2b \
   --layer 20 \
   --activation-kind resid_post \
@@ -39,7 +43,11 @@ python -m extract_llm_token_activations \
 
 # Extract the SAE features for the LLM tokens (joinable with the token annotations))
 
-python -m extract_joinable_sae_token_features \
+/usr/local/bin/gpu-job-run \
+  --memory-high 36G \
+  --memory-max 48G \
+  --oom-score-adjust 700 \
+  -- python -m src.extract_joinable_sae_token_features \
   --activations-path outputs/layers/code_token_activations_layer_20.parquet \
   --sae-release gemma-scope-2b-pt-res-canonical \
   --sae-id layer_20/width_16k/canonical \

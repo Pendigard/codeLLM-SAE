@@ -26,7 +26,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from build_token_annotation_dataset import iter_snippets
+from src.build_token_annotation_dataset import iter_snippets
 
 try:
     from tqdm.auto import tqdm

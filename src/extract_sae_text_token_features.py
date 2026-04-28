@@ -16,7 +16,7 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
-from extract_sae_token_features import (
+from src.extract_sae_token_features import (
     activation_stats,
     feature_threshold_column_name,
     load_model,

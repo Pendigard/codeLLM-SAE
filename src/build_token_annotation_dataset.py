@@ -126,10 +126,12 @@ class TreeSitterParseResult:
     char_paths: List[str]
     char_leaf_types: List[str]
     char_identifier_names: List[str]
+    char_identifier_access_kinds: List[str]
     status: str
     error: str
     scopes: List["ScopeRecord"]
     declarations: List["ScopeDeclaration"]
+    usages: List["NameUsage"]
 
 
 @dataclass(frozen=True)
@@ -140,6 +142,14 @@ class ScopeDeclaration:
     end_char: int
     scope_id: int
     scope_depth: int
+
+
+@dataclass(frozen=True)
+class NameUsage:
+    name: str
+    access_kind: str
+    start_char: int
+    end_char: int
 
 
 @dataclass(frozen=True)
@@ -602,6 +612,13 @@ def node_char_span(byte_to_char: Sequence[int], node: Any) -> tuple[int, int]:
     return byte_span_to_char_span(byte_to_char, node.start_byte, node.end_byte)
 
 
+def node_contains_node(container: Any, candidate: Any) -> bool:
+    return (
+        getattr(container, "start_byte", -1) <= getattr(candidate, "start_byte", -2)
+        and getattr(candidate, "end_byte", -1) <= getattr(container, "end_byte", -2)
+    )
+
+
 def collect_identifier_leaf_nodes(node: Any) -> List[Any]:
     results: List[Any] = []
 
@@ -654,58 +671,299 @@ def is_scope_node(node: Any, is_root: bool = False) -> bool:
     )
 
 
-def scope_decl_kind(node_type: str) -> Optional[str]:
-    if "class_" in node_type:
-        return "class"
-    if "namespace" in node_type:
-        return "namespace"
-    if node_type_contains_any(node_type, ("function", "method", "constructor")):
+def scope_decl_kind(language: str, node_type: str) -> Optional[str]:
+    function_decl_types_by_language = {
+        "C": {
+            "function_definition",
+            "function_declarator",
+        },
+        "C++": {
+            "function_definition",
+            "function_declarator",
+            "template_declaration",
+        },
+        "Java": {
+            "method_declaration",
+            "constructor_declaration",
+        },
+        "C#": {
+            "method_declaration",
+            "constructor_declaration",
+        },
+        "Javascript": {
+            "function_declaration",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+        },
+        "PHP": {
+            "function_definition",
+            "method_declaration",
+        },
+        "Python": {
+            "function_definition",
+        },
+    }
+
+    class_decl_types_by_language = {
+        "C++": {"class_specifier", "struct_specifier"},
+        "Java": {"class_declaration", "interface_declaration", "enum_declaration"},
+        "C#": {"class_declaration", "interface_declaration", "struct_declaration", "enum_declaration"},
+        "Javascript": {"class_declaration"},
+        "PHP": {"class_declaration", "interface_declaration", "trait_declaration"},
+        "Python": {"class_definition"},
+    }
+
+    namespace_decl_types_by_language = {
+        "C++": {"namespace_definition"},
+        "C#": {"namespace_declaration"},
+        "PHP": {"namespace_definition"},
+    }
+
+    if node_type in function_decl_types_by_language.get(language, set()):
         return "function"
+
+    if node_type in class_decl_types_by_language.get(language, set()):
+        return "class"
+
+    if node_type in namespace_decl_types_by_language.get(language, set()):
+        return "namespace"
+
     return None
 
 
-def declaration_kind_for_node_type(node_type: str) -> Optional[str]:
+def declaration_kind_for_node_type(language: str, node_type: str) -> Optional[str]:
     if "parameter" in node_type:
         return "parameter"
-    if node_type in {"assignment", "augmented_assignment"}:
-        return "variable"
-    if node_type in {"with_item"}:
-        return "with_alias"
-    if node_type in {"catch_clause", "except_clause"}:
-        return "exception_variable"
-    if node_type_contains_any(node_type, ("for_statement", "foreach_statement", "enhanced_for_statement")):
-        return "loop_variable"
+
     if node_type in {"variable_declarator", "init_declarator"}:
         return "variable"
+
+    if node_type in {"with_item"}:
+        return "with_alias"
+
+    if node_type in {"catch_clause", "except_clause"}:
+        return "exception_variable"
+
+    if node_type_contains_any(
+        node_type,
+        ("for_statement", "foreach_statement", "enhanced_for_statement"),
+    ):
+        return "loop_variable"
+
+    # Python : une assignation peut introduire un nom.
+    if language == "Python" and node_type == "assignment":
+        return "implicit_variable"
+
+    # PHP : selon ton objectif, tu peux considérer $x = ... comme introduction.
+    if language == "PHP" and node_type == "assignment_expression":
+        return "implicit_variable"
+
+    # JavaScript : seulement let/const/var devraient déclarer.
+    # Pas x = 1.
     return None
 
 
-def declaration_candidate_subtrees(node: Any) -> List[Any]:
+def declaration_candidate_subtrees(language: str, node: Any) -> List[Any]:
     node_type = getattr(node, "type", "")
-    field_names = {
-        "name",
-        "declarator",
-        "pattern",
-        "left",
-        "target",
-        "parameter",
-        "alias",
-    }
-    candidates = [
-        child for field_name in field_names
-        if (child := child_by_field_name_safe(node, field_name)) is not None
-    ]
 
-    if candidates:
-        return candidates
+    if node_type in {"variable_declarator", "init_declarator"}:
+        return [
+            child for field in ("name", "declarator")
+            if (child := child_by_field_name_safe(node, field)) is not None
+        ]
 
     if "parameter" in node_type:
-        return list(getattr(node, "children", []))
+        return [
+            child for field in ("name", "declarator", "pattern")
+            if (child := child_by_field_name_safe(node, field)) is not None
+        ] or list(getattr(node, "children", []))
+
+    if language == "Python" and node_type == "assignment":
+        target = (
+            child_by_field_name_safe(node, "left")
+            or child_by_field_name_safe(node, "target")
+        )
+        return [target] if target is not None else []
+
+    if language == "PHP" and node_type == "assignment_expression":
+        left = child_by_field_name_safe(node, "left")
+        return [left] if left is not None else []
+
+    if node_type in {"with_item"}:
+        alias = child_by_field_name_safe(node, "alias")
+        return [alias] if alias is not None else []
+
     if node_type in {"catch_clause", "except_clause"}:
         return list(getattr(node, "children", []))
-    if node_type_contains_any(node_type, ("for_statement", "foreach_statement", "enhanced_for_statement")):
-        return list(getattr(node, "children", []))
+
+    if node_type_contains_any(
+        node_type,
+        ("for_statement", "foreach_statement", "enhanced_for_statement"),
+    ):
+        left = (
+            child_by_field_name_safe(node, "left")
+            or child_by_field_name_safe(node, "name")
+            or child_by_field_name_safe(node, "pattern")
+        )
+        return [left] if left is not None else []
+
     return []
+
+def is_descendant_of(node, ancestor) -> bool:
+    cur = node
+    while cur is not None:
+        if cur == ancestor:
+            return True
+        cur = cur.parent
+    return False
+
+def is_direct_assignment_target(identifier_node: Any, lhs: Any) -> bool:
+    """
+    True pour x dans x = ...
+    False pour obj dans obj.x = ...
+    False pour i dans a[i] = ...
+    """
+    if lhs is None:
+        return False
+
+    if is_identifier_like_node(lhs):
+        return lhs == identifier_node
+
+    # patterns simples / parenthèses / destructuring : à adapter selon langage
+    lhs_type = getattr(lhs, "type", "")
+    if lhs_type in {
+        "tuple_pattern",
+        "list_pattern",
+        "object_pattern",
+        "array_pattern",
+        "formal_parameter",
+        "parenthesized_expression",
+        "parenthesized_pattern",
+    }:
+        return node_contains_node(lhs, identifier_node)
+
+    return False
+
+def classify_identifier_access(identifier_node: Any, ancestors: Sequence[Any]) -> str:
+    for ancestor in reversed(ancestors):
+        t = getattr(ancestor, "type", "")
+
+        if t in {"update_expression", "unary_update_expression"}:
+            return "read_write"
+
+        if t in {"augmented_assignment", "augmented_assignment_expression"}:
+            left = child_by_field_name_safe(ancestor, "left")
+            if left and is_direct_assignment_target(identifier_node, left):
+                return "read_write"
+            return "read"
+
+        if t in {"assignment", "assignment_expression"}:
+            left = child_by_field_name_safe(ancestor, "left")
+            right = child_by_field_name_safe(ancestor, "right")
+
+            if left and is_direct_assignment_target(identifier_node, left):
+                return "write"
+
+            if right and is_descendant_of(identifier_node, right):
+                return "read"
+
+            # identifiant dans un lhs complexe : obj.x, a[i], *p
+            if left and is_descendant_of(identifier_node, left):
+                return "read"
+
+            return "read"
+
+        if t in {"variable_declarator", "init_declarator"}:
+            name = (
+                child_by_field_name_safe(ancestor, "name")
+                or child_by_field_name_safe(ancestor, "declarator")
+            )
+            value = (
+                child_by_field_name_safe(ancestor, "value")
+                or child_by_field_name_safe(ancestor, "initializer")
+            )
+
+            if name and is_descendant_of(identifier_node, name):
+                return "write"
+
+            if value and is_descendant_of(identifier_node, value):
+                return "read"
+
+        if "parameter" in t:
+            name = (
+                child_by_field_name_safe(ancestor, "name")
+                or child_by_field_name_safe(ancestor, "declarator")
+            )
+            if name and is_descendant_of(identifier_node, name):
+                return "write"
+
+    return "read"
+
+def is_property_or_field_identifier(node: Any, ancestors: Sequence[Any]) -> bool:
+    node_type = getattr(node, "type", "")
+
+    if node_type in {
+        "field_identifier",
+        "property_identifier",
+        "shorthand_property_identifier",
+    }:
+        return True
+
+    for ancestor in reversed(ancestors):
+        ancestor_type = getattr(ancestor, "type", "")
+        if ancestor_type in {
+            "field_expression",
+            "member_expression",
+            "attribute",
+            "subscript_expression",
+        }:
+            # obj.x : x n'est pas forcément une variable locale
+            prop = (
+                child_by_field_name_safe(ancestor, "property")
+                or child_by_field_name_safe(ancestor, "field")
+                or child_by_field_name_safe(ancestor, "attribute")
+            )
+            if prop and is_descendant_of(node, prop):
+                return True
+
+    return False
+
+
+def collect_identifier_usages(
+    code_bytes: bytes,
+    byte_to_char: Sequence[int],
+    node: Any,
+    ancestors: Optional[List[Any]] = None,
+    results: Optional[List[NameUsage]] = None,
+) -> List[NameUsage]:
+    if ancestors is None:
+        ancestors = []
+    if results is None:
+        results = []
+
+    if is_identifier_like_node(node):
+        access_kind = classify_identifier_access(node, ancestors)
+        if is_property_or_field_identifier(node, ancestors):
+            if is_property_or_field_identifier(node, ancestors):
+                access_kind = "property"
+        name = node_byte_text(code_bytes, node)
+        start_char, end_char = node_char_span(byte_to_char, node)
+        results.append(
+            NameUsage(
+                name=name,
+                access_kind=access_kind,
+                start_char=start_char,
+                end_char=end_char,
+            )
+        )
+        return results
+
+    next_ancestors = ancestors + [node]
+    for child in getattr(node, "children", []):
+        collect_identifier_usages(code_bytes, byte_to_char, child, next_ancestors, results)
+
+    return results
 
 
 def add_declaration_from_node(
@@ -730,7 +988,7 @@ def add_declaration_from_node(
     declarations.append(
         ScopeDeclaration(
             name=name,
-            kind=kind,
+            kind="variable" if kind == "implicit_variable" else kind,
             start_char=start_char,
             end_char=end_char,
             scope_id=scope.scope_id,
@@ -739,8 +997,22 @@ def add_declaration_from_node(
     )
 
 
+def declaration_exists_before_position(
+    declarations: Sequence[ScopeDeclaration],
+    scopes: Sequence[ScopeRecord],
+    scope: ScopeRecord,
+    name: str,
+    position: int,
+) -> bool:
+    return any(
+        declaration.name == name
+        for declaration in resolve_visible_declarations(scopes, declarations, scope, position)
+    )
+
+
 def build_tree_sitter_scope_data(
     code: str,
+    language: str,
     root_node: Any,
     byte_to_char: Sequence[int],
 ) -> tuple[List[ScopeRecord], List[ScopeDeclaration]]:
@@ -764,9 +1036,12 @@ def build_tree_sitter_scope_data(
         node_type = getattr(node, "type", "")
         current_scope = active_scope
 
-        decl_kind = scope_decl_kind(node_type)
+        decl_kind = scope_decl_kind(language, node_type)
         if decl_kind is not None:
-            name_field = child_by_field_name_safe(node, "name")
+            name_field = (
+                child_by_field_name_safe(node, "name")
+                or child_by_field_name_safe(node, "declarator")
+            )
             if name_field is not None:
                 identifier_nodes = collect_identifier_leaf_nodes(name_field)
                 for identifier_node in identifier_nodes[:1]:
@@ -793,10 +1068,23 @@ def build_tree_sitter_scope_data(
             next_scope_id += 1
             scopes.append(current_scope)
 
-        inline_decl_kind = declaration_kind_for_node_type(node_type)
+        inline_decl_kind = declaration_kind_for_node_type(language, node_type)
         if inline_decl_kind is not None:
-            for candidate in declaration_candidate_subtrees(node):
+            for candidate in declaration_candidate_subtrees(language, node):
                 for identifier_node in collect_identifier_leaf_nodes(candidate):
+                    identifier_name = node_byte_text(code_bytes, identifier_node)
+                    identifier_start_char, _ = node_char_span(byte_to_char, identifier_node)
+                    if (
+                        inline_decl_kind in {"implicit_variable", "loop_variable"}
+                        and declaration_exists_before_position(
+                            declarations=declarations,
+                            scopes=scopes,
+                            scope=current_scope,
+                            name=identifier_name,
+                            position=identifier_start_char,
+                        )
+                    ):
+                        continue
                     add_declaration_from_node(
                         declarations=declarations,
                         seen=seen_declarations,
@@ -892,16 +1180,19 @@ def build_tree_sitter_char_labels(
     char_paths = [TREE_SITTER_UNKNOWN] * len(code)
     char_leaf_types = [TREE_SITTER_UNKNOWN] * len(code)
     char_identifier_names = [""] * len(code)
+    char_identifier_access_kinds = [""] * len(code)
 
     if not code:
         return TreeSitterParseResult(
             char_paths=char_paths,
             char_leaf_types=char_leaf_types,
             char_identifier_names=char_identifier_names,
+            char_identifier_access_kinds=char_identifier_access_kinds,
             status="empty",
             error="",
             scopes=[],
             declarations=[],
+            usages=[],
         )
 
     try:
@@ -910,7 +1201,8 @@ def build_tree_sitter_char_labels(
         tree = parser.parse(code_bytes)
         root_node = tree.root_node
         byte_to_char = build_byte_to_char_map(code)
-        scopes, declarations = build_tree_sitter_scope_data(code, root_node, byte_to_char)
+        scopes, declarations = build_tree_sitter_scope_data(code, language, root_node, byte_to_char)
+        usages = collect_identifier_usages(code_bytes, byte_to_char, root_node)
 
         for leaf in collect_tree_sitter_leaf_paths(code_bytes, root_node):
             start_char, end_char = byte_span_to_char_span(
@@ -925,15 +1217,21 @@ def build_tree_sitter_char_labels(
                 if is_identifier_like_type(leaf["type"]):
                     char_identifier_names[char_index] = leaf_text
 
+        for usage in usages:
+            for char_index in range(usage.start_char, min(usage.end_char, len(code))):
+                char_identifier_access_kinds[char_index] = usage.access_kind
+
         has_error = getattr(root_node, "has_error", False)
         return TreeSitterParseResult(
             char_paths=char_paths,
             char_leaf_types=char_leaf_types,
             char_identifier_names=char_identifier_names,
+            char_identifier_access_kinds=char_identifier_access_kinds,
             status="parsed_with_errors" if has_error else "ok",
             error="",
             scopes=scopes,
             declarations=declarations,
+            usages=usages,
         )
     except Exception as exc:
         if fail_on_error:
@@ -943,10 +1241,12 @@ def build_tree_sitter_char_labels(
             char_paths=char_paths,
             char_leaf_types=char_leaf_types,
             char_identifier_names=char_identifier_names,
+            char_identifier_access_kinds=char_identifier_access_kinds,
             status="error",
             error=str(exc),
             scopes=[],
             declarations=[],
+            usages=[],
         )
 
 
@@ -997,6 +1297,59 @@ def select_tree_sitter_labels(path_slice: Sequence[str], leaf_slice: Sequence[st
     return TREE_SITTER_UNKNOWN, TREE_SITTER_UNKNOWN
 
 
+def find_token_pos_for_char(offsets: Sequence[tuple[int, int]], char_position: int) -> Optional[int]:
+    for token_pos, (start, end) in enumerate(offsets):
+        if start <= char_position < end:
+            return token_pos
+    for token_pos, (start, end) in enumerate(offsets):
+        if end > char_position and start != end:
+            return token_pos
+    return None
+
+
+def find_declaration_covering_token(
+    declarations: Sequence[ScopeDeclaration],
+    name: str,
+    start: int,
+    end: int,
+) -> Optional[ScopeDeclaration]:
+    for declaration in declarations:
+        if (
+            declaration.name == name
+            and start < declaration.end_char
+            and declaration.start_char < end
+        ):
+            return declaration
+    return None
+
+
+def find_usage_covering_token(
+    usages: Sequence[NameUsage],
+    name: str,
+    start: int,
+    end: int,
+) -> Optional[NameUsage]:
+    for usage in usages:
+        if usage.name == name and start < usage.end_char and usage.start_char < end:
+            return usage
+    return None
+
+
+def declaration_key(declaration: Optional[ScopeDeclaration], fallback_name: str) -> tuple[Any, ...]:
+    if declaration is None:
+        return ("unresolved", fallback_name)
+    return (
+        declaration.scope_id,
+        declaration.name,
+        declaration.start_char,
+        declaration.end_char,
+        declaration.kind,
+    )
+
+def span_overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+    return a_start < b_end and b_start < a_end
+
+
 def build_rows_for_snippet(
     snippet: SnippetRecord,
     tokenizer: Any,
@@ -1017,6 +1370,12 @@ def build_rows_for_snippet(
         registry=parser_registry,
         fail_on_error=args.fail_on_tree_sitter_error,
     )
+    offsets = llm_tokens["offset_mapping"]
+    declaration_token_pos_by_key = {
+        declaration_key(declaration, declaration.name): find_token_pos_for_char(offsets, declaration.start_char)
+        for declaration in tree_sitter.declarations
+    }
+    last_write_token_pos_by_key: Dict[tuple[Any, ...], int] = {}
 
     rows: List[Dict[str, Any]] = []
     for token_pos, (token_id, offsets, tokenizer_token, decoded_token) in enumerate(
@@ -1073,13 +1432,44 @@ def build_rows_for_snippet(
         visible_kinds = [declaration.kind for declaration in visible_declarations]
         visible_decl_starts = [declaration.start_char for declaration in visible_declarations]
         visible_by_name = {declaration.name: declaration for declaration in visible_declarations}
-        is_name_like_token = pygments_simple_label in NAME_LIKE_PYGMENTS_LABELS
-        matched_name = identifier_name or token_text
+        is_name_like_token = bool(identifier_name) or pygments_simple_label in NAME_LIKE_PYGMENTS_LABELS
+        matched_name = identifier_name or token_text.strip()
+        current_declaration = (
+            find_declaration_covering_token(tree_sitter.declarations, matched_name, start, end)
+            if is_name_like_token and matched_name and start != end
+            else None
+        )
+        current_usage = (
+            find_usage_covering_token(tree_sitter.usages, matched_name, start, end)
+            if is_name_like_token and matched_name and start != end
+            else None
+        )
         matched_declaration = visible_by_name.get(matched_name) if is_name_like_token and matched_name else None
-        token_name_is_decl = any(
-            declaration.name == matched_name and declaration.start_char == start
-            for declaration in tree_sitter.declarations
-        ) if is_name_like_token and matched_name else False
+        token_name_is_decl = (
+            current_declaration is not None
+            and span_overlaps(
+                start,
+                end,
+                current_declaration.start_char,
+                current_declaration.end_char,
+            )
+        )
+        effective_declaration = current_declaration if token_name_is_decl else matched_declaration
+        effective_declaration_key = declaration_key(effective_declaration, matched_name) if matched_name else None
+        declaration_token_pos = (
+            declaration_token_pos_by_key.get(effective_declaration_key)
+            if effective_declaration_key is not None
+            else None
+        )
+        last_write_token_pos = (
+            last_write_token_pos_by_key.get(effective_declaration_key)
+            if effective_declaration_key is not None
+            else None
+        )
+        access_kind = current_usage.access_kind if current_usage is not None else None
+        is_read = access_kind in {"read", "read_write"}
+        is_write = access_kind in {"write", "read_write"}
+        is_read_write = access_kind == "read_write"
 
         row = {
             "snippet_id": snippet.snippet_id,
@@ -1113,10 +1503,32 @@ def build_rows_for_snippet(
             "token_name_is_in_scope": matched_declaration is not None,
             "token_name_is_decl": token_name_is_decl,
             "token_name_scope_kind": matched_declaration.kind if matched_declaration is not None else None,
+            "token_variable_access_kind": access_kind,
+            "token_variable_is_read": is_read,
+            "token_variable_is_write": is_write,
+            "token_variable_is_read_write": is_read_write,
+            "token_variable_usage_start": current_usage.start_char if current_usage is not None else None,
+            "token_variable_usage_end": current_usage.end_char if current_usage is not None else None,
+            "token_name_declaration_token_pos": declaration_token_pos,
+            "token_name_distance_to_declaration_tokens": (
+                token_pos - declaration_token_pos if declaration_token_pos is not None else None
+            ),
+            "token_name_last_write_token_pos": last_write_token_pos,
+            "token_name_distance_to_last_write_tokens": (
+                token_pos - last_write_token_pos if last_write_token_pos is not None else None
+            ),
         }
         if args.include_code:
             row["code"] = snippet.code
         rows.append(row)
+
+        if (
+            is_write
+            and current_usage is not None
+            and effective_declaration_key is not None
+            and end >= current_usage.end_char
+        ):
+            last_write_token_pos_by_key[effective_declaration_key] = token_pos
 
     return rows
 
@@ -1207,6 +1619,16 @@ class PyArrowTableWriter(BaseWriter):
                 pa.field("token_name_is_in_scope", pa.bool_()),
                 pa.field("token_name_is_decl", pa.bool_()),
                 pa.field("token_name_scope_kind", pa.string()),
+                pa.field("token_variable_access_kind", pa.string()),
+                pa.field("token_variable_is_read", pa.bool_()),
+                pa.field("token_variable_is_write", pa.bool_()),
+                pa.field("token_variable_is_read_write", pa.bool_()),
+                pa.field("token_variable_usage_start", pa.int64()),
+                pa.field("token_variable_usage_end", pa.int64()),
+                pa.field("token_name_declaration_token_pos", pa.int64()),
+                pa.field("token_name_distance_to_declaration_tokens", pa.int64()),
+                pa.field("token_name_last_write_token_pos", pa.int64()),
+                pa.field("token_name_distance_to_last_write_tokens", pa.int64()),
                 pa.field("code", pa.string()),
             ]
         )
@@ -1230,6 +1652,13 @@ class PyArrowTableWriter(BaseWriter):
             normalized.setdefault("code", None)
             normalized.setdefault("token_identifier_name", None)
             normalized.setdefault("token_name_scope_kind", None)
+            normalized.setdefault("token_variable_access_kind", None)
+            normalized.setdefault("token_variable_usage_start", None)
+            normalized.setdefault("token_variable_usage_end", None)
+            normalized.setdefault("token_name_declaration_token_pos", None)
+            normalized.setdefault("token_name_distance_to_declaration_tokens", None)
+            normalized.setdefault("token_name_last_write_token_pos", None)
+            normalized.setdefault("token_name_distance_to_last_write_tokens", None)
             normalized_rows.append(normalized)
         table = self._pa.Table.from_pylist(normalized_rows, schema=self._schema)
         if self._file_format == "parquet":
