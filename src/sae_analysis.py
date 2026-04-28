@@ -1,25 +1,75 @@
 from __future__ import annotations
 
+import ast
 from itertools import combinations
 from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
+import json
+import os
+import tqdm
+import matplotlib.pyplot as plt
+from matplotlib import patches
+from matplotlib import colors as mcolors
+
+from circuitsvis.tokens import colored_tokens
 
 
-def _normalize_top_feature_list(value: object) -> list[int]:
-    if isinstance(value, (list, tuple, set)):
-        return [int(v) for v in value if v is not None]
-    if value is None or (isinstance(value, float) and np.isnan(value)):
+def _normalize_top_feature_list(value):
+    """Normalize a feature-id field into a list[int]."""
+    if value is None:
         return []
+
+    if isinstance(value, float) and np.isnan(value):
+        return []
+
+    if isinstance(value, (list, tuple, np.ndarray, pd.Series)):
+        arr = np.asarray(value).reshape(-1)
+        return [int(x) for x in arr if pd.notna(x)]
+
+    # si jamais la colonne contient parfois une string du type "[1, 2, 3]"
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return []
+        try:
+            parsed = ast.literal_eval(value)
+            if isinstance(parsed, (list, tuple, np.ndarray)):
+                arr = np.asarray(parsed).reshape(-1)
+                return [int(x) for x in arr if pd.notna(x)]
+            return [int(parsed)]
+        except (ValueError, SyntaxError):
+            return [int(value)]
+
     return [int(value)]
 
 
-def _normalize_numeric_list(value: object) -> list[float]:
-    if isinstance(value, (list, tuple, set)):
-        return [float(v) for v in value if v is not None]
-    if value is None or (isinstance(value, float) and np.isnan(value)):
+def _normalize_numeric_list(value):
+    """Normalize a numeric field into a list[float]."""
+    if value is None:
         return []
+
+    if isinstance(value, float) and np.isnan(value):
+        return []
+
+    if isinstance(value, (list, tuple, np.ndarray, pd.Series)):
+        arr = np.asarray(value).reshape(-1)
+        return [float(x) for x in arr if pd.notna(x)]
+
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return []
+        try:
+            parsed = ast.literal_eval(value)
+            if isinstance(parsed, (list, tuple, np.ndarray)):
+                arr = np.asarray(parsed).reshape(-1)
+                return [float(x) for x in arr if pd.notna(x)]
+            return [float(parsed)]
+        except (ValueError, SyntaxError):
+            return [float(value)]
+
     return [float(value)]
 
 
@@ -710,3 +760,407 @@ def plot_feature_token_wordcloud(
         f"threshold >= {activation_threshold}, mode={weight_mode}"
     )
     return ax, safe_weights
+
+def get_feature_activation(row, feature_id, activation_threshold=0.0, top_k=None):
+    feature_ids = row["top_k_feature_ids"]
+    activations = row["top_k_feature_activations"]
+
+    if top_k is not None:
+        feature_ids = feature_ids[:top_k]
+        activations = activations[:top_k]
+
+    for fid, act in zip(feature_ids, activations):
+        if fid == feature_id and act >= activation_threshold:
+            return float(act)
+
+    return 0.0
+
+
+def visualize_feature_on_snippet_circuitsvis(
+    df: pd.DataFrame,
+    global_idx,
+    language: str,
+    feature_id: int,
+    activation_threshold: float = 0.0,
+    top_k=None,
+    token_col: str = "token_text",
+):
+    """
+    Visualize feature activations token-by-token using circuitsvis.
+
+    Parameters
+    ----------
+    df:
+        DataFrame containing one row per token.
+
+    global_idx:
+        Snippet identifier.
+
+    language:
+        Language of the snippet.
+
+    feature_id:
+        SAE feature id to visualize.
+
+    activation_threshold:
+        Minimum activation required to display the feature as active.
+
+    top_k:
+        If not None, only search inside the first top_k features
+        of each token.
+
+    token_col:
+        Column used for display, e.g. "token_text",
+        "token_decoded", or "tokenizer_token".
+    """
+
+    snippet_df = df[
+        (df["global_idx"].astype(str) == str(global_idx))
+        & (df["language"] == language)
+    ].copy()
+
+    if snippet_df.empty:
+        raise ValueError(
+            f"No snippet found for global_idx={global_idx}, language={language}"
+        )
+
+    snippet_df = snippet_df.sort_values("token_pos")
+
+    snippet_df["feature_activation"] = snippet_df.apply(
+        lambda row: get_feature_activation(
+            row,
+            feature_id=feature_id,
+            activation_threshold=activation_threshold,
+            top_k=top_k,
+        ),
+        axis=1,
+    )
+
+    tokens = snippet_df[token_col].astype(str).tolist()
+    values = snippet_df["feature_activation"].astype(float).tolist()
+
+    return colored_tokens(tokens, values)
+
+def compute_PMI(
+    df: pd.DataFrame,
+    feature_id: int,
+    mask_label: pd.Series,
+    activation_threshold: float = 0.0,
+    ):
+
+    mask_feature = df['top_k_feature_ids'].apply(lambda x: feature_id in x)
+
+    exploded_inter = df[mask_feature & mask_label].explode(['top_k_feature_ids', 'top_k_feature_activations'])
+
+    P_inter = len(exploded_inter[(exploded_inter['top_k_feature_ids'] == feature_id) & (exploded_inter['top_k_feature_activations'] >= activation_threshold)]) / len(df)
+
+    exploded_feature = df[mask_feature].explode(['top_k_feature_ids', 'top_k_feature_activations'])
+    P_feature = len(exploded_feature[(exploded_feature['top_k_feature_ids'] == feature_id) & (exploded_feature['top_k_feature_activations'] >= activation_threshold)]) / len(df)
+
+    P_label = mask_label.mean()
+
+    PMI = np.log2(P_inter / (P_feature * P_label)) if P_inter > 0 and P_feature > 0 and P_label > 0 else float('-inf')
+    return PMI
+
+
+def add_neighbor_tokens(df, relative_positions=[-2, -1, 1, 2], col = "token_str"):
+    df = df.copy()
+
+    # Une seule ligne par token réel
+    token_df = (
+        df.sort_values(["global_idx", "language", "token_pos"])
+          .drop_duplicates(subset=["global_idx", "language", "token_pos"])
+          .copy()
+    )
+
+    new_cols = []
+
+    # Tokens voisins par snippet
+    for rel_pos in relative_positions:
+        col_prefix = "previous" if rel_pos < 0 else "next"
+        col_suffix = abs(rel_pos)
+        col_name = f"{col_prefix}_{col}_{col_suffix}"
+        token_df[col_name] = token_df.groupby(["global_idx", "language"])[col].shift(-rel_pos)
+        new_cols.append(col_name)
+
+    # Reprojection sur le df original
+    cols_to_merge = [
+        "global_idx", "language", "token_pos",
+        *new_cols
+    ]
+
+    df = df.merge(
+        token_df[cols_to_merge],
+        on=["global_idx", "language", "token_pos"],
+        how="left"
+    )
+
+    return df
+
+def get_description(feature_id : int, models = ["gpt-4o-mini", "gemini-flash-2.0"], folder_path = "/Users/celian/Documents/Fac/M2/RIKEN Traineeship/projects/labeled_features/"):
+    for model in models:
+        path = os.path.join(folder_path, f"explanations-{model}")
+        for file in os.listdir(path):
+            # check file is a jsonl
+            if file.endswith(".jsonl"):
+                with open(os.path.join(path, file), "r") as f:
+                    for line in f:
+                        data = json.loads(line)
+                        if data["index"] == str(feature_id):
+                            print(f"Model: {model}, Explanation: {data['description']}")
+
+
+
+def compute_all_features_pmi(
+    df: pd.DataFrame,
+    mask_label: pd.Series,
+    activation_threshold: float = 0.0,
+) -> pd.DataFrame:
+    """
+    Compute binary PMI and activation-weighted PMI for every feature.
+
+    Binary PMI:
+        feature is present if activation >= activation_threshold
+
+    Weighted PMI:
+        uses activation mass instead of binary presence.
+
+    Required columns:
+        - top_k_feature_ids
+        - top_k_feature_activations
+    """
+
+    if len(mask_label) != len(df):
+        raise ValueError("mask_label must have the same length as df")
+
+    mask_label = mask_label.astype(bool)
+    N = len(df)
+    P_label = mask_label.mean()
+
+    output_cols = [
+        "feature_id",
+        "count_feature",
+        "count_intersection",
+        "P_feature",
+        "P_label",
+        "P_inter",
+        "PMI",
+        "activation_feature",
+        "activation_intersection",
+        "P_weighted_feature",
+        "P_weighted_label",
+        "P_weighted_inter",
+        "weighted_PMI",
+    ]
+
+    if P_label == 0 or N == 0:
+        return pd.DataFrame(columns=output_cols)
+
+    tmp = df[["top_k_feature_ids", "top_k_feature_activations"]].copy()
+    tmp = tmp.reset_index(names="token_idx")
+    tmp["mask_label"] = mask_label.to_numpy()
+
+    exploded = tmp.explode(
+        ["top_k_feature_ids", "top_k_feature_activations"],
+        ignore_index=True
+    )
+
+    exploded = exploded.rename(
+        columns={
+            "top_k_feature_ids": "feature_id",
+            "top_k_feature_activations": "activation",
+        }
+    )
+
+    exploded["activation"] = pd.to_numeric(exploded["activation"], errors="coerce")
+    exploded = exploded.dropna(subset=["feature_id", "activation"])
+
+    # On garde les activations >= threshold pour définir la présence
+    # et pour la masse d'activation pondérée
+    exploded = exploded[exploded["activation"] >= activation_threshold].copy()
+
+    if exploded.empty:
+        return pd.DataFrame(columns=output_cols)
+
+    # Une feature ne compte qu'une fois par token.
+    # Si doublon rare, on garde l'activation max.
+    exploded = (
+        exploded
+        .groupby(["token_idx", "feature_id"], as_index=False)
+        .agg(
+            activation=("activation", "max"),
+            mask_label=("mask_label", "first")
+        )
+    )
+
+    # =========================
+    # Binary PMI
+    # =========================
+
+    count_feature = (
+        exploded
+        .groupby("feature_id")
+        .size()
+        .rename("count_feature")
+    )
+
+    count_intersection = (
+        exploded[exploded["mask_label"]]
+        .groupby("feature_id")
+        .size()
+        .rename("count_intersection")
+    )
+
+    result = pd.concat([count_feature, count_intersection], axis=1).fillna(0)
+
+    result["count_feature"] = result["count_feature"].astype(int)
+    result["count_intersection"] = result["count_intersection"].astype(int)
+
+    result["P_feature"] = result["count_feature"] / N
+    result["P_label"] = P_label
+    result["P_inter"] = result["count_intersection"] / N
+
+    result["PMI"] = np.where(
+        result["count_intersection"] > 0,
+        np.log2(result["P_inter"] / (result["P_feature"] * result["P_label"])),
+        float("-inf")
+    )
+
+    # =========================
+    # Weighted PMI
+    # =========================
+
+    total_activation = exploded["activation"].sum()
+
+    activation_feature = (
+        exploded
+        .groupby("feature_id")["activation"]
+        .sum()
+        .rename("activation_feature")
+    )
+
+    activation_intersection = (
+        exploded[exploded["mask_label"]]
+        .groupby("feature_id")["activation"]
+        .sum()
+        .rename("activation_intersection")
+    )
+
+    result = pd.concat(
+        [result, activation_feature, activation_intersection],
+        axis=1
+    ).fillna(0)
+
+    label_activation_mass = exploded.loc[
+        exploded["mask_label"], "activation"
+    ].sum()
+
+    result["P_weighted_feature"] = result["activation_feature"] / total_activation
+    result["P_weighted_label"] = label_activation_mass / total_activation
+    result["P_weighted_inter"] = result["activation_intersection"] / total_activation
+
+    result["weighted_PMI"] = np.where(
+        result["activation_intersection"] > 0,
+        np.log2(
+            result["P_weighted_inter"]
+            / (result["P_weighted_feature"] * result["P_weighted_label"])
+        ),
+        float("-inf")
+    )
+
+    return (
+        result
+        .reset_index()
+        .sort_values("PMI", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+def plot_language_feature_distribution(
+    df: pd.DataFrame,
+    feature_id: int,
+    language_col: str = "language",
+    ax=None,
+):
+    feature_mask = df['top_k_feature_ids'].apply(lambda x: feature_id in x)
+    counts = df[feature_mask][language_col].value_counts()
+
+    if ax is None:
+        _, ax = plt.subplots(dpi=300)
+
+    counts.plot.bar(ax=ax)
+    ax.set_title(f"Language distribution for feature {feature_id}")
+    ax.set_xlabel(language_col)
+    ax.set_ylabel("Count")
+    return ax
+
+def pie_plot_per_feature(df: pd.DataFrame, feature_id: int, label_col: str, ax=None):
+
+    feature_mask = df['top_k_feature_ids'].apply(lambda x: feature_id in x)
+    counts = df[feature_mask][label_col].value_counts()
+
+    if ax is None:
+        _, ax = plt.subplots()
+
+    counts.plot.pie(ax=ax, autopct='%1.1f%%', startangle=90)
+    ax.set_title(f"Distribution of {label_col} for feature {feature_id}")
+    ax.set_ylabel("")
+    return ax
+
+def get_snippets_with_feature(
+    df: pd.DataFrame,
+    feature_id: int,
+    activation_threshold: float = 0.1,
+    top_k: int = 5,
+):
+    """
+    Return rows where `feature_id` is present among the top_k features
+    of the token, with activation >= activation_threshold.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain:
+            - top_k_feature_ids
+            - top_k_feature_activations
+
+    feature_id : int
+        Feature to search.
+
+    activation_threshold : float
+        Minimum activation required.
+
+    top_k : int
+        Only search inside the first top_k ranked features.
+
+    Returns
+    -------
+    pd.DataFrame
+        Matching rows sorted by feature activation descending.
+    """
+
+    def get_feature_activation(row):
+        ids = row["top_k_feature_ids"][:top_k]
+        acts = row["top_k_feature_activations"][:top_k]
+
+        for fid, act in zip(ids, acts):
+            if fid == feature_id and act >= activation_threshold:
+                return act
+
+        return None
+
+    result = df.copy()
+
+    result["feature_activation"] = result.apply(
+        get_feature_activation,
+        axis=1
+    )
+
+    result = result[result["feature_activation"].notna()]
+
+    result = result.sort_values(
+        "feature_activation",
+        ascending=False
+    ).reset_index(drop=True)
+
+    return result
